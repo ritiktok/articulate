@@ -347,21 +347,84 @@ class _CanvasPageViewState extends State<_CanvasPageView> {
                   ),
                   child: Row(
                     children: [
-                      Icon(Icons.error_outline, color: Palette.error, size: 16),
+                      Icon(
+                        Icons.error_outline,
+                        color: Palette.onErrorContainer,
+                        size: 20,
+                      ),
                       const SizedBox(width: 8),
                       Expanded(
                         child: Text(
                           state.aiError!,
-                          style: TextStyle(fontSize: 12, color: Palette.error),
+                          style: Styles.bodyMedium.copyWith(
+                            color: Palette.onErrorContainer,
+                          ),
                         ),
                       ),
                       IconButton(
-                        icon: Icon(Icons.close, color: Palette.error, size: 16),
-                        onPressed: () => _canvasCubit.clearAIError(),
-                        padding: EdgeInsets.zero,
-                        constraints: const BoxConstraints(),
+                        onPressed: () {
+                          context.read<CanvasCubit>().clearAIError();
+                        },
+                        icon: const Icon(Icons.close, size: 16),
+                        style: IconButton.styleFrom(
+                          foregroundColor: Palette.onErrorContainer,
+                          minimumSize: const Size(24, 24),
+                          padding: EdgeInsets.zero,
+                        ),
                       ),
                     ],
+                  ),
+                ),
+              );
+            },
+          ),
+          BlocBuilder<CanvasCubit, CanvasState>(
+            builder: (context, state) {
+              if (state.syncStatus != SyncStatus.syncing) {
+                return const SizedBox.shrink();
+              }
+              return Positioned.fill(
+                child: Container(
+                  color: Colors.black.withValues(alpha: 0.3),
+                  child: Center(
+                    child: Container(
+                      padding: const EdgeInsets.all(Styles.spacingL),
+                      decoration: BoxDecoration(
+                        color: Palette.surface,
+                        borderRadius: BorderRadius.circular(Styles.radiusL),
+                        boxShadow: [
+                          BoxShadow(
+                            color: Colors.black.withValues(alpha: 0.2),
+                            blurRadius: 10,
+                            offset: const Offset(0, 4),
+                          ),
+                        ],
+                      ),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          CircularProgressIndicator(
+                            color: Palette.primary,
+                            strokeWidth: 3,
+                          ),
+                          const SizedBox(height: Styles.spacingM),
+                          Text(
+                            'Syncing offline strokes...',
+                            style: Styles.bodyMedium.copyWith(
+                              color: Palette.textPrimary,
+                            ),
+                          ),
+                          const SizedBox(height: Styles.spacingS),
+                          Text(
+                            'Please wait while your offline drawings are uploaded',
+                            style: Styles.bodySmall.copyWith(
+                              color: Palette.textSecondary,
+                            ),
+                            textAlign: TextAlign.center,
+                          ),
+                        ],
+                      ),
+                    ),
                   ),
                 ),
               );
@@ -441,6 +504,34 @@ class _CanvasPageViewState extends State<_CanvasPageView> {
                           child: const Icon(Icons.clear),
                         ),
                       ),
+
+                    Container(
+                      margin: const EdgeInsets.only(bottom: 8),
+                      child: FloatingActionButton.small(
+                        heroTag: 'replay_button',
+                        onPressed: () {
+                          final repository = context
+                              .read<HybridCanvasRepository>();
+
+                          Navigator.of(context).push(
+                            MaterialPageRoute(
+                              builder: (context) => BlocProvider.value(
+                                value: _canvasCubit,
+                                child: ReplayPage(
+                                  sessionId: widget.sessionId,
+                                  userId: widget.userId,
+                                  title: widget.title,
+                                  repository: repository,
+                                ),
+                              ),
+                            ),
+                          );
+                        },
+                        backgroundColor: Palette.primaryContainer,
+                        foregroundColor: Palette.onPrimaryContainer,
+                        child: const Icon(Icons.replay),
+                      ),
+                    ),
                   ],
                 );
               },
@@ -484,50 +575,6 @@ class _CanvasPageViewState extends State<_CanvasPageView> {
               foregroundColor: Palette.onError,
             ),
             child: const Text('Clear'),
-          ),
-        ],
-      ),
-    );
-  }
-
-  void _showDeleteAllDataDialog(BuildContext context) {
-    showDialog(
-      context: context,
-      builder: (dialogContext) => AlertDialog(
-        backgroundColor: Palette.surface,
-        surfaceTintColor: Palette.primaryContainer,
-        shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(Styles.radiusL),
-        ),
-        title: Row(
-          children: [
-            Icon(Icons.warning, color: Palette.error, size: 24),
-            const SizedBox(width: 8),
-            Text('Delete Current Session Data', style: Styles.titleLarge),
-          ],
-        ),
-        content: Text(
-          'This will permanently delete all locally stored drawings for the current session. This action cannot be undone and will not affect data stored on the server.',
-          style: Styles.bodyMedium,
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(dialogContext).pop(),
-            child: Text(
-              'Cancel',
-              style: Styles.labelLarge.copyWith(color: Palette.primary),
-            ),
-          ),
-          FilledButton(
-            onPressed: () async {
-              Navigator.of(dialogContext).pop();
-              await _canvasCubit.deleteCurrentSessionData();
-            },
-            style: FilledButton.styleFrom(
-              backgroundColor: Palette.error,
-              foregroundColor: Palette.onError,
-            ),
-            child: const Text('Delete Session Data'),
           ),
         ],
       ),
@@ -578,26 +625,6 @@ class _CanvasPageViewState extends State<_CanvasPageView> {
             ),
 
             ListTile(
-              leading: const Icon(Icons.replay),
-              title: const Text('Replay Session'),
-              subtitle: const Text('Watch drawing replay'),
-              onTap: () {
-                Navigator.pop(context);
-                Navigator.push(
-                  context,
-                  MaterialPageRoute(
-                    builder: (context) => ReplayPage(
-                      sessionId: widget.sessionId,
-                      userId: widget.userId,
-                      title: widget.title,
-                      repository: context.read<HybridCanvasRepository>(),
-                    ),
-                  ),
-                );
-              },
-            ),
-
-            ListTile(
               leading: const Icon(Icons.help_outline),
               title: const Text('Voice Commands Help'),
               subtitle: const Text('Learn voice controls'),
@@ -607,16 +634,6 @@ class _CanvasPageViewState extends State<_CanvasPageView> {
                   context: context,
                   builder: (context) => const VoiceHelpDialog(),
                 );
-              },
-            ),
-
-            ListTile(
-              leading: const Icon(Icons.delete_forever, color: Colors.red),
-              title: const Text('Delete Current Session Data'),
-              subtitle: const Text('Clear stored drawings for this session'),
-              onTap: () {
-                Navigator.pop(context);
-                _showDeleteAllDataDialog(context);
               },
             ),
 

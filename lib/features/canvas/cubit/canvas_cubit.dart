@@ -17,6 +17,7 @@ class CanvasCubit extends Cubit<CanvasState> {
 
   StreamSubscription? _strokesSubscription;
   StreamSubscription? _hybridConnectivitySubscription;
+  StreamSubscription? _syncStatusSubscription;
 
   CanvasCubit({
     required HybridCanvasRepository remoteRepository,
@@ -36,8 +37,7 @@ class CanvasCubit extends Cubit<CanvasState> {
   Future<void> close() async {
     _strokesSubscription?.cancel();
     _hybridConnectivitySubscription?.cancel();
-
-    await _remoteRepository.dispose();
+    _syncStatusSubscription?.cancel();
 
     return super.close();
   }
@@ -133,6 +133,8 @@ class CanvasCubit extends Cubit<CanvasState> {
     _strokesSubscription = null;
     _hybridConnectivitySubscription?.cancel();
     _hybridConnectivitySubscription = null;
+    _syncStatusSubscription?.cancel();
+    _syncStatusSubscription = null;
 
     _remoteRepository.clearActiveSession();
   }
@@ -143,7 +145,8 @@ class CanvasCubit extends Cubit<CanvasState> {
         _remoteRepository.setActiveSession(sessionId);
         _startRealTimeStrokeUpdates(sessionId);
         _startHybridConnectivityMonitoring();
-        await _checkUndoRedoAvailability();
+        _startSyncStatusMonitoring();
+        await _updateUndoRedoState();
       } catch (e) {
         if (kDebugMode) {
           print('Error initializing session features: $e');
@@ -153,7 +156,10 @@ class CanvasCubit extends Cubit<CanvasState> {
   }
 
   void startDrawing(Offset point) {
-    if (state.currentSession == null) return;
+    if (state.currentSession == null ||
+        state.syncStatus == SyncStatus.syncing) {
+      return;
+    }
 
     final stroke = DrawingStroke(
       id: const Uuid().v4(),
@@ -178,7 +184,11 @@ class CanvasCubit extends Cubit<CanvasState> {
   }
 
   void continueDrawing(Offset point) {
-    if (state.currentStroke == null || state.currentSession == null) return;
+    if (state.currentStroke == null ||
+        state.currentSession == null ||
+        state.syncStatus == SyncStatus.syncing) {
+      return;
+    }
 
     final newPoint = DrawingPoint(
       point: point,
@@ -196,7 +206,11 @@ class CanvasCubit extends Cubit<CanvasState> {
   }
 
   Future<void> endDrawing() async {
-    if (state.currentStroke == null || state.currentSession == null) return;
+    if (state.currentStroke == null ||
+        state.currentSession == null ||
+        state.syncStatus == SyncStatus.syncing) {
+      return;
+    }
 
     final stroke = state.currentStroke!;
     final sessionId = state.currentSession!.id;
@@ -206,6 +220,7 @@ class CanvasCubit extends Cubit<CanvasState> {
 
     try {
       _addWithRetry(() => _remoteRepository.addStroke(sessionId, stroke));
+      await _updateUndoRedoState();
     } catch (e) {
       if (kDebugMode) {
         print('Error saving stroke to remote repository: $e');
@@ -221,8 +236,8 @@ class CanvasCubit extends Cubit<CanvasState> {
         .listen(
           (remoteStrokes) {
             try {
+              _updateUndoRedoState();
               emit(state.copyWith(strokes: remoteStrokes));
-              _checkUndoRedoAvailability();
             } catch (e) {
               if (kDebugMode) {
                 print('Error processing real-time stroke updates: $e');
@@ -235,6 +250,16 @@ class CanvasCubit extends Cubit<CanvasState> {
             }
           },
         );
+  }
+
+  Future<void> _handleOnlineTransition(String sessionId) async {
+    try {
+      await _remoteRepository.handleOnlineTransitionWithFetch(sessionId);
+    } catch (e) {
+      if (kDebugMode) {
+        print('Error during online transition: $e');
+      }
+    }
   }
 
   Future<void> handleVoiceCommand(
@@ -421,20 +446,15 @@ class CanvasCubit extends Cubit<CanvasState> {
 
   Future<void> undo() async {
     await _createOperationStroke('undo', isActive: false);
-    await _checkUndoRedoAvailability();
+    await _updateUndoRedoState();
   }
 
   Future<void> redo() async {
     await _createOperationStroke('redo', isActive: true);
-    await _checkUndoRedoAvailability();
+    await _updateUndoRedoState();
   }
 
-  Future<void> clear() async {
-    await _createOperationStroke('clear', isActive: false);
-    await _checkUndoRedoAvailability();
-  }
-
-  Future<void> _checkUndoRedoAvailability() async {
+  Future<void> _updateUndoRedoState() async {
     if (state.currentSession == null) return;
 
     try {
@@ -444,22 +464,30 @@ class CanvasCubit extends Cubit<CanvasState> {
       emit(state.copyWith(canUndo: canUndo, canRedo: canRedo));
     } catch (e) {
       if (kDebugMode) {
-        print('Failed to check undo/redo availability: $e');
+        print('Error updating undo/redo state: $e');
       }
     }
   }
 
-  Future<void> refreshUndoRedoState() async {
-    await _checkUndoRedoAvailability();
+  Future<void> clear() async {
+    await _createOperationStroke('clear', isActive: false);
+    await _updateUndoRedoState();
   }
 
   void _startHybridConnectivityMonitoring() {
     final hybridRepo = _remoteRepository;
     _hybridConnectivitySubscription = hybridRepo.connectivityStream.listen((
       isOnline,
-    ) {
+    ) async {
+      final wasOffline = !state.isConnected;
+      final isNowOnline = isOnline;
+
       if (state.isConnected != isOnline) {
         emit(state.copyWith(isConnected: isOnline));
+      }
+
+      if (wasOffline && isNowOnline && state.currentSession != null) {
+        await _handleOnlineTransition(state.currentSession!.id);
       }
 
       if (state.currentSession != null) {
@@ -469,6 +497,14 @@ class CanvasCubit extends Cubit<CanvasState> {
       if (isOnline && state.currentSession != null) {
         _attemptSessionRecovery();
       }
+    });
+  }
+
+  void _startSyncStatusMonitoring() {
+    _syncStatusSubscription = _remoteRepository.syncStatusStream.listen((
+      syncStatus,
+    ) {
+      emit(state.copyWith(syncStatus: syncStatus));
     });
   }
 
@@ -507,20 +543,6 @@ class CanvasCubit extends Cubit<CanvasState> {
     emit(state.copyWith(aiError: null));
   }
 
-  Future<void> deleteAllLocalData() async {
-    try {
-      await _remoteRepository.deleteAllLocalData();
-
-      emit(state.copyWith(strokes: [], currentStroke: null, aiError: null));
-    } catch (e) {
-      emit(state.copyWith(aiError: 'Failed to delete local data: $e'));
-    }
-  }
-
-  Future<void> deleteCurrentSessionData() async {
-    await deleteAllLocalData();
-  }
-
   void generateNewDrawing() async {
     if (state.strokes.isEmpty) return;
 
@@ -556,6 +578,8 @@ class CanvasCubit extends Cubit<CanvasState> {
           );
         }
       }
+
+      await _updateUndoRedoState();
     } catch (e) {
       emit(
         state.copyWith(

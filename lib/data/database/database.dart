@@ -72,27 +72,57 @@ class CanvasDatabase extends _$CanvasDatabase {
         .get();
   }
 
-  Future<int> getNextLocalVersion(String sessionId) async {
-    final result =
-        await (select(strokes)
-              ..where(
-                (tbl) =>
-                    tbl.sessionId.equals(sessionId) &
-                    tbl.localVersion.isNotNull(),
-              )
-              ..orderBy([(s) => OrderingTerm.asc(s.localVersion)])
-              ..limit(1))
-            .getSingleOrNull();
+  Future<bool> canUndo(String sessionId) async {
+    final count =
+        await (strokes.select()
+              ..where((t) => t.sessionId.equals(sessionId))
+              ..where((t) => t.isActive.equals(true)))
+            .get()
+            .then((rows) => rows.length);
 
-    return (result?.localVersion ?? -0) - 1;
+    return count > 0;
+  }
+
+  Future<bool> canRedo(String sessionId) async {
+    final count =
+        await (strokes.select()
+              ..where((t) => t.sessionId.equals(sessionId))
+              ..where((t) => t.isActive.equals(false)))
+            .get()
+            .then((rows) => rows.length);
+
+    return count > 0;
+  }
+
+  Future<int> getNextLocalVersion(String sessionId) async {
+    return await transaction(() async {
+      final result =
+          await (select(strokes)
+                ..where(
+                  (tbl) =>
+                      tbl.sessionId.equals(sessionId) &
+                      tbl.localVersion.isNotNull(),
+                )
+                ..orderBy([(s) => OrderingTerm.asc(s.localVersion)])
+                ..limit(1))
+              .getSingleOrNull();
+
+      return (result?.localVersion ?? -0) - 1;
+    });
   }
 
   Future<int> addStroke(StrokesCompanion stroke) {
-    return into(strokes).insert(stroke);
+    return transaction(() async {
+      return await into(strokes).insert(stroke);
+    });
   }
 
-  Future<int> addOrUpdateStroke(StrokesCompanion stroke) {
-    return into(strokes).insertOnConflictUpdate(stroke);
+  Future<void> batchAddOrUpdateStrokes(List<StrokesCompanion> strokes) {
+    return transaction(() async {
+      await batch((batch) {
+        batch.insertAllOnConflictUpdate(this.strokes, strokes);
+      });
+    });
   }
 
   Stream<List<Stroke>> watchStrokesForSession(String sessionId) {
@@ -104,26 +134,12 @@ class CanvasDatabase extends _$CanvasDatabase {
 
     return (select(strokeAlias)
           ..where(
-            (s) => s.sessionId.equals(sessionId) & s.operation.equals('draw'),
+            (s) =>
+                s.sessionId.equals(sessionId) &
+                s.operation.equals('draw') &
+                s.isActive.equals(true),
           )
           ..orderBy([(_) => OrderingTerm(expression: orderExpr)]))
-        .watch();
-  }
-
-  Stream<List<Stroke>> watchAllPendingStrokes() {
-    return (select(strokes)
-          ..where((s) => s.syncStatus.equals('pending'))
-          ..orderBy([(s) => OrderingTerm.asc(s.createdAt)]))
-        .watch();
-  }
-
-  Stream<List<Stroke>> watchPendingStrokesForSession(String sessionId) {
-    return (select(strokes)
-          ..where(
-            (s) =>
-                s.sessionId.equals(sessionId) & s.syncStatus.equals('pending'),
-          )
-          ..orderBy([(s) => OrderingTerm.asc(s.createdAt)]))
         .watch();
   }
 
@@ -134,32 +150,37 @@ class CanvasDatabase extends _$CanvasDatabase {
         .get();
   }
 
-  Future<List<String>> getSessionIdsWithPendingSync() {
-    return (select(strokes)..where((s) => s.syncStatus.equals('pending')))
-        .map((row) => row.sessionId)
-        .get()
-        .then((sessionIds) => sessionIds.toSet().toList());
-  }
-
   Future<void> updateStrokeSyncStatus(
     String strokeId,
-    String serverId,
     int serverVersion,
     DateTime serverCreatedAt,
   ) async {
-    if (kDebugMode) {
-      print('Updating stroke sync status: $strokeId');
-    }
+    await transaction(() async {
+      final existingStroke = await (select(
+        strokes,
+      )..where((s) => s.id.equals(strokeId))).getSingleOrNull();
 
-    await (update(strokes)..where((s) => s.id.equals(strokeId))).write(
-      StrokesCompanion(
-        id: Value(serverId),
-        version: Value(serverVersion),
-        createdAt: Value(serverCreatedAt),
-        localVersion: const Value.absent(),
-        syncStatus: Value('synced'),
-      ),
-    );
+      if (existingStroke != null) {
+        await (update(strokes)..where((s) => s.id.equals(strokeId))).write(
+          StrokesCompanion(
+            version: Value(serverVersion),
+            createdAt: Value(serverCreatedAt),
+            localVersion: const Value.absent(),
+            syncStatus: Value('synced'),
+          ),
+        );
+      } else {
+        await (update(strokes)..where((s) => s.id.equals(strokeId))).write(
+          StrokesCompanion(
+            id: Value(strokeId),
+            version: Value(serverVersion),
+            createdAt: Value(serverCreatedAt),
+            localVersion: const Value.absent(),
+            syncStatus: Value('synced'),
+          ),
+        );
+      }
+    });
   }
 
   Future<void> updateStrokeActiveStatus(
@@ -167,27 +188,24 @@ class CanvasDatabase extends _$CanvasDatabase {
     String strokeId,
     bool isActive,
   ) async {
-    await (update(strokes)
-          ..where((s) => s.sessionId.equals(sessionId) & s.id.equals(strokeId)))
-        .write(StrokesCompanion(isActive: Value(isActive)));
+    await transaction(() async {
+      await (update(strokes)..where(
+            (s) => s.sessionId.equals(sessionId) & s.id.equals(strokeId),
+          ))
+          .write(StrokesCompanion(isActive: Value(isActive)));
+    });
   }
 
   Future<void> updateAllDrawStrokesActiveStatus(
     String sessionId,
     bool isActive,
   ) async {
-    await (update(strokes)..where(
-          (s) => s.sessionId.equals(sessionId) & s.operation.equals('draw'),
-        ))
-        .write(StrokesCompanion(isActive: Value(isActive)));
-  }
-
-  Future<void> deleteAllLocalData() async {
-    await delete(strokes).go();
-  }
-
-  Future<void> deleteLocalDataForSession(String sessionId) async {
-    await (delete(strokes)..where((s) => s.sessionId.equals(sessionId))).go();
+    await transaction(() async {
+      await (update(strokes)..where(
+            (s) => s.sessionId.equals(sessionId) & s.operation.equals('draw'),
+          ))
+          .write(StrokesCompanion(isActive: Value(isActive)));
+    });
   }
 }
 

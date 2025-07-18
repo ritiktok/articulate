@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'package:articulate/data/repositories/supabase_canvas_repository.dart';
+import 'package:articulate/features/canvas/cubit/canvas_state.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter/foundation.dart';
 import '../models/canvas_session.dart';
@@ -11,18 +12,14 @@ class HybridCanvasRepository {
   final SupabaseCanvasRepository _remoteRepository;
   bool _isOnline = false;
   String? _activeSessionId;
+  bool _isInitialSyncComplete = false;
   final StreamController<bool> _connectivityController =
       StreamController<bool>.broadcast();
+  final StreamController<SyncStatus> _syncStatusController =
+      StreamController<SyncStatus>.broadcast();
 
   StreamSubscription<List<DrawingStroke>>? _remoteToLocalSubscription;
-  StreamSubscription<List<DrawingStroke>>? _localToRemoteSubscription;
   StreamSubscription<List<ConnectivityResult>>? _connectivitySubscription;
-
-  final Set<String> _pendingSyncStrokeIds = {};
-  final Map<String, DateTime> _failedSyncStrokes = {};
-
-  Timer? _localChangeDebounceTimer;
-  Timer? _cleanupTimer;
 
   HybridCanvasRepository({
     required DriftCanvasRepository localRepository,
@@ -30,28 +27,25 @@ class HybridCanvasRepository {
   }) : _localRepository = localRepository,
        _remoteRepository = remoteRepository {
     _initializeConnectivity();
-    _startCleanupTimer();
   }
 
   Stream<bool> get connectivityStream => _connectivityController.stream;
+  Stream<SyncStatus> get syncStatusStream => _syncStatusController.stream;
 
   bool get isOnline => _isOnline;
 
   void setActiveSession(String sessionId) {
     _activeSessionId = sessionId;
+    _isInitialSyncComplete = false;
     if (_isOnline) {
-      _disposeBidirectionalSync();
-      _setupBidirectionalSync();
+      _handleOnlineTransition();
     }
   }
 
   void clearActiveSession() {
     _activeSessionId = null;
-    _disposeBidirectionalSync();
-  }
-
-  Future<void> deleteAllLocalData() async {
-    await _localRepository.deleteAllLocalData();
+    _isInitialSyncComplete = false;
+    _disposeRemoteToLocalSync();
   }
 
   void _initializeConnectivity() {
@@ -66,42 +60,60 @@ class HybridCanvasRepository {
       if (wasOnline != _isOnline) {
         _connectivityController.add(_isOnline);
         if (_isOnline) {
-          _setupBidirectionalSync();
-          await _recoverOfflineStrokes();
+          await _handleOnlineTransition();
         } else {
-          _disposeBidirectionalSync();
+          _disposeRemoteToLocalSync();
+          _isInitialSyncComplete = false;
         }
       }
     });
   }
 
-  void _startCleanupTimer() {
-    _cleanupTimer = Timer.periodic(const Duration(minutes: 5), (timer) {
-      _cleanupFailedSyncStrokes();
-    });
-  }
+  Future<void> _handleOnlineTransition() async {
+    if (!_isOnline || _activeSessionId == null) return;
 
-  void _cleanupFailedSyncStrokes() {
-    final now = DateTime.now();
-    final expiredStrokes = _failedSyncStrokes.entries
-        .where((entry) => now.difference(entry.value).inMinutes > 10)
-        .map((entry) => entry.key)
-        .toList();
+    try {
+      await _syncOfflineStrokes();
 
-    for (final strokeId in expiredStrokes) {
-      _failedSyncStrokes.remove(strokeId);
-      _pendingSyncStrokeIds.remove(strokeId);
-    }
+      _isInitialSyncComplete = true;
 
-    if (expiredStrokes.isNotEmpty) {
+      _setupRemoteToLocalSync();
+    } catch (e) {
       if (kDebugMode) {
-        print('Cleaned up ${expiredStrokes.length} failed sync strokes');
+        print('Error during online transition: $e');
       }
     }
   }
 
-  void _setupBidirectionalSync() {
-    if (!_isOnline || _activeSessionId == null) return;
+  Future<List<DrawingStroke>> handleOnlineTransitionWithFetch(
+    String sessionId,
+  ) async {
+    if (!_isOnline) return <DrawingStroke>[];
+
+    try {
+      await _syncOfflineStrokes();
+
+      _isInitialSyncComplete = true;
+
+      final allStrokes = await _remoteRepository.getAllStrokesForSession(
+        sessionId,
+      );
+
+      _setupRemoteToLocalSync();
+
+      return allStrokes;
+    } catch (e) {
+      if (kDebugMode) {
+        print('Error during online transition with fetch: $e');
+      }
+      rethrow;
+    }
+  }
+
+  void _setupRemoteToLocalSync() {
+    if (!_isOnline || _activeSessionId == null || !_isInitialSyncComplete) {
+      return;
+    }
 
     try {
       _remoteToLocalSubscription = _remoteRepository
@@ -114,68 +126,31 @@ class HybridCanvasRepository {
               if (kDebugMode) {
                 print('Error in remote to local sync: $error');
               }
-              _retryRemoteToLocalSync();
-            },
-            cancelOnError: false,
-          );
-
-      _localToRemoteSubscription = _localRepository
-          .watchPendingStrokesForSession(_activeSessionId!)
-          .listen(
-            (localStrokes) {
-              _handleLocalToRemoteSync(localStrokes);
-            },
-            onError: (error) {
-              if (kDebugMode) {
-                print('Error in local to remote sync: $error');
-              }
-              _retryLocalToRemoteSync();
             },
             cancelOnError: false,
           );
     } catch (e) {
       if (kDebugMode) {
-        print('Failed to setup bidirectional sync: $e');
+        print('Failed to setup remote to local sync: $e');
       }
     }
   }
 
-  void _disposeBidirectionalSync() {
+  void _disposeRemoteToLocalSync() {
     _remoteToLocalSubscription?.cancel();
     _remoteToLocalSubscription = null;
-
-    _localToRemoteSubscription?.cancel();
-    _localToRemoteSubscription = null;
-
-    _pendingSyncStrokeIds.clear();
-    _localChangeDebounceTimer?.cancel();
   }
 
   Future<void> _handleRemoteToLocalSync(
     List<DrawingStroke> remoteStrokes,
   ) async {
-    if (!_isOnline) return;
+    if (!_isOnline || remoteStrokes.isEmpty || !_isInitialSyncComplete) return;
 
     try {
-      for (final stroke in remoteStrokes) {
-        if (_pendingSyncStrokeIds.contains(stroke.id)) {
-          continue;
-        }
-
-        try {
-          await _localRepository.updateStrokeFromRemote(
-            stroke.sessionId,
-            stroke,
-          );
-          if (kDebugMode) {
-            print('Synced remote stroke to local: ${stroke.id}');
-          }
-        } catch (e) {
-          if (kDebugMode) {
-            print('Failed to sync remote stroke to local: $e');
-          }
-        }
-      }
+      await _localRepository.batchUpdateStrokesFromRemote(
+        remoteStrokes.first.sessionId,
+        remoteStrokes,
+      );
     } catch (e) {
       if (kDebugMode) {
         print('Error in remote to local sync: $e');
@@ -183,88 +158,77 @@ class HybridCanvasRepository {
     }
   }
 
-  Future<void> _handleLocalToRemoteSync(
-    List<DrawingStroke> localStrokes,
-  ) async {
-    if (!_isOnline) return;
+  bool _isSyncing = false;
 
+  Future<void> _syncOfflineStrokes() async {
+    if (!_isOnline || _activeSessionId == null || _isSyncing) {
+      return;
+    }
+
+    _isSyncing = true;
     try {
-      for (final stroke in localStrokes) {
-        if (_pendingSyncStrokeIds.contains(stroke.id) ||
-            stroke.syncStatus == 'synced') {
-          continue;
-        }
+      _syncStatusController.add(SyncStatus.syncing);
 
-        if (_failedSyncStrokes.containsKey(stroke.id)) {
-          final lastFailure = _failedSyncStrokes[stroke.id]!;
-          if (DateTime.now().difference(lastFailure).inMinutes < 5) {
-            continue;
-          }
-        }
+      final offlineStrokes = await _localRepository.getOfflineStrokes(
+        _activeSessionId!,
+      );
 
-        _pendingSyncStrokeIds.add(stroke.id);
+      if (offlineStrokes.isEmpty) {
+        _syncStatusController.add(SyncStatus.synced);
+        return;
+      }
 
+      final strokesToSync = offlineStrokes
+          .where((stroke) => stroke.version == null)
+          .toList();
+
+      if (strokesToSync.isEmpty) {
+        _syncStatusController.add(SyncStatus.synced);
+        return;
+      }
+
+      for (final stroke in strokesToSync) {
         try {
           final result = await _remoteRepository.addStroke(
-            stroke.sessionId,
+            _activeSessionId!,
             stroke,
           );
 
-          final serverId = result['id'] as String;
           final serverVersion = result['version'] as int;
           final serverCreatedAt = DateTime.parse(result['created_at']);
 
           await _localRepository.updateStrokeSyncStatus(
             stroke.id,
-            serverId,
             serverVersion,
             serverCreatedAt,
           );
 
-          _failedSyncStrokes.remove(stroke.id);
-
           if (kDebugMode) {
-            print('Synced local stroke to remote: ${stroke.id}');
+            print('Synced offline stroke: ${stroke.id}');
           }
         } catch (e) {
           if (kDebugMode) {
-            print('Failed to sync local stroke to remote: $e');
+            print('Failed to sync stroke ${stroke.id}: $e');
           }
-          _failedSyncStrokes[stroke.id] = DateTime.now();
-        } finally {
-          _pendingSyncStrokeIds.remove(stroke.id);
         }
       }
+
+      _syncStatusController.add(SyncStatus.synced);
     } catch (e) {
       if (kDebugMode) {
-        print('Error in local to remote sync: $e');
+        print('Failed to sync offline strokes: $e');
       }
+      _syncStatusController.add(SyncStatus.error);
+    } finally {
+      _isSyncing = false;
     }
   }
 
-  void _retryRemoteToLocalSync() {
-    Future.delayed(const Duration(seconds: 5), () {
-      if (_isOnline) {
-        _disposeBidirectionalSync();
-        _setupBidirectionalSync();
-      }
-    });
-  }
-
-  void _retryLocalToRemoteSync() {
-    Future.delayed(const Duration(seconds: 5), () {
-      if (_isOnline) {
-        _disposeBidirectionalSync();
-        _setupBidirectionalSync();
-      }
-    });
-  }
-
   Future<void> dispose() async {
-    _disposeBidirectionalSync();
+    _disposeRemoteToLocalSync();
     _connectivitySubscription?.cancel();
-    _cleanupTimer?.cancel();
     await _connectivityController.close();
+    await _syncStatusController.close();
     await _localRepository.close();
   }
 
@@ -340,161 +304,18 @@ class HybridCanvasRepository {
   }
 
   Stream<List<DrawingStroke>> watchStrokes(String sessionId) {
-    if (_isOnline) {
-      return _remoteRepository.watchStrokesForSession(sessionId);
-    } else {
-      return _localRepository.watchStrokes(sessionId);
-    }
+    return _localRepository.watchStrokes(sessionId);
   }
 
   Future<List<DrawingStroke>> getStrokesForSession(String sessionId) async {
-    try {
-      if (_isOnline) {
-        final remoteStrokes = await _remoteRepository.getStrokesForSession(
-          sessionId,
-        );
-        return remoteStrokes;
-      } else {
-        final localStrokes = await _localRepository.getActiveStrokesForSession(
-          sessionId,
-        );
-        return localStrokes
-            .map((stroke) => DrawingStroke.fromJson(stroke.toJson()))
-            .toList();
-      }
-    } catch (e) {
-      if (kDebugMode) {
-        print('Failed to get strokes for session: $e');
-      }
-
-      try {
-        final localStrokes = await _localRepository.getActiveStrokesForSession(
-          sessionId,
-        );
-        return localStrokes
-            .map((stroke) => DrawingStroke.fromJson(stroke.toJson()))
-            .toList();
-      } catch (localError) {
-        if (kDebugMode) {
-          print('Failed to get strokes from local: $localError');
-        }
-        return [];
-      }
-    }
+    return await _localRepository.getActiveStrokes(sessionId);
   }
 
   Future<bool> canUndo(String sessionId) async {
-    try {
-      if (_isOnline) {
-        return await _remoteRepository.canUndo(sessionId);
-      } else {
-        return await _localRepository.canUndo(sessionId);
-      }
-    } catch (e) {
-      if (kDebugMode) {
-        print('Failed to check if can undo: $e');
-      }
-
-      try {
-        return await _localRepository.canUndo(sessionId);
-      } catch (localError) {
-        if (kDebugMode) {
-          print('Failed to check if can undo from local: $localError');
-        }
-        return false;
-      }
-    }
+    return await _localRepository.canUndo(sessionId);
   }
 
   Future<bool> canRedo(String sessionId) async {
-    try {
-      if (_isOnline) {
-        return await _remoteRepository.canRedo(sessionId);
-      } else {
-        return await _localRepository.canRedo(sessionId);
-      }
-    } catch (e) {
-      if (kDebugMode) {
-        print('Failed to check if can redo: $e');
-      }
-
-      try {
-        return await _localRepository.canRedo(sessionId);
-      } catch (localError) {
-        if (kDebugMode) {
-          print('Failed to check if can redo from local: $localError');
-        }
-        return false;
-      }
-    }
-  }
-
-  Future<void> _recoverOfflineStrokes() async {
-    if (!_isOnline || _activeSessionId == null) return;
-
-    try {
-      await _recoverSessionOfflineStrokes(_activeSessionId!);
-    } catch (e) {
-      if (kDebugMode) {
-        print('Failed to recover offline strokes: $e');
-      }
-    }
-  }
-
-  Future<void> _recoverSessionOfflineStrokes(String sessionId) async {
-    try {
-      final existingSession = await _remoteRepository.getSession(sessionId);
-      if (existingSession == null) {
-        if (kDebugMode) {
-          print('Session $sessionId not found in remote, skipping recovery');
-        }
-        return;
-      }
-
-      final offlineStrokes = await _localRepository.getOfflineStrokes(
-        sessionId,
-      );
-
-      if (offlineStrokes.isEmpty) {
-        if (kDebugMode) {
-          print('No offline strokes to recover for session $sessionId');
-        }
-        return;
-      }
-
-      if (kDebugMode) {
-        print(
-          'Recovering ${offlineStrokes.length} offline strokes for session $sessionId',
-        );
-      }
-
-      for (final stroke in offlineStrokes) {
-        try {
-          final result = await _remoteRepository.addStroke(sessionId, stroke);
-          final serverId = result['id'] as String;
-          final serverVersion = result['version'] as int;
-          final serverCreatedAt = DateTime.parse(result['created_at']);
-
-          await _localRepository.updateStrokeSyncStatus(
-            stroke.id,
-            serverId,
-            serverVersion,
-            serverCreatedAt,
-          );
-
-          if (kDebugMode) {
-            print('Recovered offline stroke: ${stroke.id}');
-          }
-        } catch (e) {
-          if (kDebugMode) {
-            print('Failed to recover stroke ${stroke.id}: $e');
-          }
-        }
-      }
-    } catch (e) {
-      if (kDebugMode) {
-        print('Failed to recover offline strokes for session $sessionId: $e');
-      }
-    }
+    return await _localRepository.canRedo(sessionId);
   }
 }

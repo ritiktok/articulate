@@ -7,6 +7,8 @@ enum CanvasStatus { initial, loading, connected, disconnected, error }
 
 enum DrawingTool { brush, eraser, rectangle, circle, line }
 
+enum SyncStatus { idle, syncing, synced, error }
+
 class CanvasState extends Equatable {
   final CanvasStatus status;
   final CanvasSession? currentSession;
@@ -19,6 +21,8 @@ class CanvasState extends Equatable {
   final String? errorMessage;
   final bool isAnalyzing;
   final String? aiError;
+  final SyncStatus syncStatus;
+  final String? syncErrorMessage;
   final bool canUndo;
   final bool canRedo;
 
@@ -34,6 +38,8 @@ class CanvasState extends Equatable {
     this.errorMessage,
     this.isAnalyzing = false,
     this.aiError,
+    this.syncStatus = SyncStatus.idle,
+    this.syncErrorMessage,
     this.canUndo = false,
     this.canRedo = false,
   });
@@ -51,6 +57,8 @@ class CanvasState extends Equatable {
     errorMessage,
     isAnalyzing,
     aiError,
+    syncStatus,
+    syncErrorMessage,
     canUndo,
     canRedo,
   ];
@@ -67,6 +75,8 @@ class CanvasState extends Equatable {
     String? errorMessage,
     bool? isAnalyzing,
     String? aiError,
+    SyncStatus? syncStatus,
+    String? syncErrorMessage,
     bool? canUndo,
     bool? canRedo,
   }) {
@@ -82,6 +92,8 @@ class CanvasState extends Equatable {
       errorMessage: errorMessage ?? this.errorMessage,
       isAnalyzing: isAnalyzing ?? this.isAnalyzing,
       aiError: aiError ?? this.aiError,
+      syncStatus: syncStatus ?? this.syncStatus,
+      syncErrorMessage: syncErrorMessage ?? this.syncErrorMessage,
       canUndo: canUndo ?? this.canUndo,
       canRedo: canRedo ?? this.canRedo,
     );

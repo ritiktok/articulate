@@ -13,7 +13,6 @@ class DrawingStroke extends Equatable {
   final int? version;
   final bool isActive;
   final DateTime createdAt;
-  final String syncStatus;
 
   const DrawingStroke({
     required this.id,
@@ -25,7 +24,6 @@ class DrawingStroke extends Equatable {
     this.targetStrokeId,
     this.isActive = true,
     this.version,
-    this.syncStatus = 'pending',
   });
 
   @override
@@ -39,7 +37,6 @@ class DrawingStroke extends Equatable {
     targetStrokeId,
     isActive,
     version,
-    syncStatus,
   ];
 
   DrawingStroke copyWith({
@@ -52,7 +49,6 @@ class DrawingStroke extends Equatable {
     String? targetStrokeId,
     bool? isActive,
     int? version,
-    String? syncStatus,
   }) {
     return DrawingStroke(
       id: id ?? this.id,
@@ -64,7 +60,6 @@ class DrawingStroke extends Equatable {
       targetStrokeId: targetStrokeId ?? this.targetStrokeId,
       isActive: isActive ?? this.isActive,
       version: version ?? this.version,
-      syncStatus: syncStatus ?? this.syncStatus,
     );
   }
 
@@ -79,7 +74,6 @@ class DrawingStroke extends Equatable {
       'target_stroke_id': targetStrokeId,
       'is_active': isActive,
       'version': version,
-      'sync_status': syncStatus,
     };
   }
 
@@ -114,7 +108,6 @@ class DrawingStroke extends Equatable {
       targetStrokeId: json['target_stroke_id'] ?? json['targetStrokeId'],
       isActive: json['is_active'] ?? json['isActive'] ?? true,
       version: json['version'],
-      syncStatus: json['sync_status'] ?? json['syncStatus'] ?? 'pending',
     );
   }
 

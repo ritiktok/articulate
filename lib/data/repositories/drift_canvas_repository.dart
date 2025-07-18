@@ -1,6 +1,5 @@
 import 'dart:convert';
 import 'package:drift/drift.dart';
-import 'package:uuid/uuid.dart';
 import '../models/drawing_stroke.dart';
 import '../models/drawing_point.dart';
 import '../database/database.dart';
@@ -12,23 +11,6 @@ class DriftCanvasRepository {
 
   Future<void> close() async {
     await _database.close();
-  }
-
-  Future<void> deleteAllLocalData() async {
-    await _database.deleteAllLocalData();
-  }
-
-  Future<List<DrawingStroke>> getActiveStrokesForSession(
-    String sessionId,
-  ) async {
-    try {
-      final strokes = await _database.getActiveStrokesForSession(sessionId);
-      return strokes
-          .map((stroke) => DrawingStroke.fromJson(stroke.toJson()))
-          .toList();
-    } catch (e) {
-      throw Exception('Failed to get active strokes for session: $e');
-    }
   }
 
   Future<void> addStroke(String sessionId, DrawingStroke stroke) async {
@@ -83,33 +65,163 @@ class DriftCanvasRepository {
     DrawingStroke stroke,
     int? nextLocalVersion,
   ) async {
-    final activeStrokes = await _database.getActiveStrokesForSession(sessionId);
-    final drawStrokes = activeStrokes
-        .where((s) => s.operation == 'draw')
-        .toList();
-
-    if (drawStrokes.isNotEmpty) {
-      drawStrokes.sort(
-        (a, b) => (a.version ?? -(a.localVersion ?? 0)).compareTo(
-          b.version ?? -(b.localVersion ?? 0),
-        ),
-      );
-      final targetStroke = drawStrokes.last;
-
-      await _database.updateStrokeActiveStatus(
+    await _database.transaction(() async {
+      final activeStrokes = await _database.getActiveStrokesForSession(
         sessionId,
-        targetStroke.id,
-        false,
       );
+      final drawStrokes = activeStrokes
+          .where((s) => s.operation == 'draw')
+          .toList();
 
-      final undoStrokeCompanion = StrokesCompanion.insert(
+      if (drawStrokes.isNotEmpty) {
+        drawStrokes.sort((a, b) {
+          if (a.localVersion != null && b.localVersion != null) {
+            return a.localVersion!.compareTo(b.localVersion!);
+          }
+
+          if (a.version != null && b.version != null) {
+            return b.version!.compareTo(a.version!);
+          }
+
+          if (a.localVersion != null && b.version != null) {
+            return -1;
+          }
+          if (a.version != null && b.localVersion != null) {
+            return 1;
+          }
+
+          if (a.localVersion != null) return -1;
+          if (b.localVersion != null) return 1;
+
+          if (a.version != null) return -1;
+          if (b.version != null) return 1;
+
+          return 0;
+        });
+        final targetStroke = drawStrokes.first;
+
+        await _database.updateStrokeActiveStatus(
+          sessionId,
+          targetStroke.id,
+          false,
+        );
+
+        final undoStrokeCompanion = StrokesCompanion.insert(
+          id: stroke.id,
+          sessionId: sessionId,
+          userId: stroke.userId,
+          points: jsonEncode(stroke.points.map((p) => p.toJson()).toList()),
+          createdAt: stroke.createdAt,
+          operation: const Value('undo'),
+          targetStrokeId: Value(targetStroke.id),
+          isActive: const Value(false),
+          version: stroke.version != null
+              ? Value(stroke.version!)
+              : const Value.absent(),
+          localVersion: nextLocalVersion != null
+              ? Value(nextLocalVersion)
+              : const Value.absent(),
+          syncStatus: stroke.version != null
+              ? Value('synced')
+              : const Value('pending'),
+        );
+
+        await _database.addStroke(undoStrokeCompanion);
+      }
+    });
+  }
+
+  Future<void> _handleRedoOperation(
+    String sessionId,
+    DrawingStroke stroke,
+    int? nextLocalVersion,
+  ) async {
+    await _database.transaction(() async {
+      final allStrokes = await _database.getStrokesForSession(sessionId);
+      final undoStrokes = allStrokes
+          .where((s) => s.operation == 'undo' && s.targetStrokeId != null)
+          .toList();
+
+      if (undoStrokes.isNotEmpty) {
+        undoStrokes.sort((a, b) {
+          if (a.localVersion != null && b.localVersion != null) {
+            return a.localVersion!.compareTo(b.localVersion!);
+          }
+
+          if (a.version != null && b.version != null) {
+            return b.version!.compareTo(a.version!);
+          }
+
+          if (a.localVersion != null && b.version != null) {
+            return -1;
+          }
+          if (a.version != null && b.localVersion != null) {
+            return 1;
+          }
+
+          if (a.localVersion != null) return -1;
+          if (b.localVersion != null) return 1;
+
+          if (a.version != null) return -1;
+          if (b.version != null) return 1;
+
+          return 0;
+        });
+        final lastUndoStroke = undoStrokes.first;
+
+        final targetStroke = allStrokes
+            .where((s) => s.id == lastUndoStroke.targetStrokeId)
+            .firstOrNull;
+
+        if (targetStroke != null && !targetStroke.isActive) {
+          await _database.updateStrokeActiveStatus(
+            sessionId,
+            targetStroke.id,
+            true,
+          );
+
+          final redoStrokeCompanion = StrokesCompanion.insert(
+            id: stroke.id,
+            sessionId: sessionId,
+            userId: stroke.userId,
+            points: jsonEncode(stroke.points.map((p) => p.toJson()).toList()),
+            createdAt: stroke.createdAt,
+            operation: const Value('redo'),
+            targetStrokeId: Value(targetStroke.id),
+            isActive: const Value(true),
+            version: stroke.version != null
+                ? Value(stroke.version!)
+                : const Value.absent(),
+            localVersion: nextLocalVersion != null
+                ? Value(nextLocalVersion)
+                : const Value.absent(),
+            syncStatus: stroke.version != null
+                ? Value('synced')
+                : const Value('pending'),
+          );
+
+          await _database.addStroke(redoStrokeCompanion);
+        }
+      }
+    });
+  }
+
+  Future<void> _handleClearOperation(
+    String sessionId,
+    DrawingStroke stroke,
+    int? nextLocalVersion,
+  ) async {
+    await _database.transaction(() async {
+      await _database.updateAllDrawStrokesActiveStatus(sessionId, false);
+
+      final clearStrokeCompanion = StrokesCompanion.insert(
         id: stroke.id,
         sessionId: sessionId,
         userId: stroke.userId,
         points: jsonEncode(stroke.points.map((p) => p.toJson()).toList()),
         createdAt: stroke.createdAt,
-        operation: const Value('undo'),
-        targetStrokeId: Value(targetStroke.id),
+        operation: const Value('clear'),
+        targetStrokeId: const Value.absent(),
         isActive: const Value(false),
         version: stroke.version != null
             ? Value(stroke.version!)
@@ -122,191 +234,20 @@ class DriftCanvasRepository {
             : const Value('pending'),
       );
 
-      await _database.addStroke(undoStrokeCompanion);
-    }
-  }
-
-  Future<void> _handleRedoOperation(
-    String sessionId,
-    DrawingStroke stroke,
-    int? nextLocalVersion,
-  ) async {
-    final allStrokes = await _database.getStrokesForSession(sessionId);
-    final undoStrokes = allStrokes
-        .where((s) => s.operation == 'undo' && s.targetStrokeId != null)
-        .toList();
-
-    if (undoStrokes.isNotEmpty) {
-      undoStrokes.sort(
-        (a, b) => (a.version ?? -(a.localVersion ?? 0)).compareTo(
-          b.version ?? -(b.localVersion ?? 0),
-        ),
-      );
-      final lastUndoStroke = undoStrokes.last;
-
-      final targetStroke = allStrokes
-          .where((s) => s.id == lastUndoStroke.targetStrokeId)
-          .firstOrNull;
-
-      if (targetStroke != null && !targetStroke.isActive) {
-        await _database.updateStrokeActiveStatus(
-          sessionId,
-          targetStroke.id,
-          true,
-        );
-
-        final redoStrokeCompanion = StrokesCompanion.insert(
-          id: stroke.id,
-          sessionId: sessionId,
-          userId: stroke.userId,
-          points: jsonEncode(stroke.points.map((p) => p.toJson()).toList()),
-          createdAt: stroke.createdAt,
-          operation: const Value('redo'),
-          targetStrokeId: Value(targetStroke.id),
-          isActive: const Value(true),
-          version: stroke.version != null
-              ? Value(stroke.version!)
-              : const Value.absent(),
-          localVersion: nextLocalVersion != null
-              ? Value(nextLocalVersion)
-              : const Value.absent(),
-          syncStatus: stroke.version != null
-              ? Value('synced')
-              : const Value('pending'),
-        );
-
-        await _database.addStroke(redoStrokeCompanion);
-      }
-    }
-  }
-
-  Future<void> _handleClearOperation(
-    String sessionId,
-    DrawingStroke stroke,
-    int? nextLocalVersion,
-  ) async {
-    await _database.updateAllDrawStrokesActiveStatus(sessionId, false);
-
-    final clearStrokeCompanion = StrokesCompanion.insert(
-      id: stroke.id,
-      sessionId: sessionId,
-      userId: stroke.userId,
-      points: jsonEncode(stroke.points.map((p) => p.toJson()).toList()),
-      createdAt: stroke.createdAt,
-      operation: const Value('clear'),
-      targetStrokeId: const Value.absent(),
-      isActive: const Value(false),
-      version: stroke.version != null
-          ? Value(stroke.version!)
-          : const Value.absent(),
-      localVersion: nextLocalVersion != null
-          ? Value(nextLocalVersion)
-          : const Value.absent(),
-      syncStatus: stroke.version != null
-          ? Value('synced')
-          : const Value('pending'),
-    );
-
-    await _database.addStroke(clearStrokeCompanion);
-  }
-
-  Future<void> undo(String sessionId, String userId) async {
-    final undoStroke = DrawingStroke(
-      id: const Uuid().v4(),
-      sessionId: sessionId,
-      userId: userId,
-      points: [],
-      createdAt: DateTime.now(),
-      operation: 'undo',
-      isActive: false,
-    );
-
-    await addStroke(sessionId, undoStroke);
-  }
-
-  Future<void> redo(String sessionId, String userId) async {
-    final redoStroke = DrawingStroke(
-      id: const Uuid().v4(),
-      sessionId: sessionId,
-      userId: userId,
-      points: [],
-      createdAt: DateTime.now(),
-      operation: 'redo',
-      isActive: false,
-    );
-
-    await addStroke(sessionId, redoStroke);
-  }
-
-  Future<void> clear(String sessionId, String userId) async {
-    final clearStroke = DrawingStroke(
-      id: const Uuid().v4(),
-      sessionId: sessionId,
-      userId: userId,
-      points: [],
-      createdAt: DateTime.now(),
-      operation: 'clear',
-      isActive: false,
-    );
-
-    await addStroke(sessionId, clearStroke);
+      await _database.addStroke(clearStrokeCompanion);
+    });
   }
 
   Future<bool> canUndo(String sessionId) async {
-    final activeStrokes = await _database.getActiveStrokesForSession(sessionId);
-    final drawStrokes = activeStrokes
-        .where((s) => s.operation == 'draw')
-        .toList();
-    return drawStrokes.isNotEmpty;
+    return await _database.canUndo(sessionId);
   }
 
   Future<bool> canRedo(String sessionId) async {
-    final allStrokes = await _database.getStrokesForSession(sessionId);
-    final undoStrokes = allStrokes
-        .where((s) => s.operation == 'undo' && s.targetStrokeId != null)
-        .toList();
-
-    if (undoStrokes.isEmpty) return false;
-
-    undoStrokes.sort(
-      (a, b) => (a.version ?? -(a.localVersion ?? 0)).compareTo(
-        b.version ?? -(b.localVersion ?? 0),
-      ),
-    );
-    final lastUndoStroke = undoStrokes.last;
-
-    final targetStroke = allStrokes
-        .where((s) => s.id == lastUndoStroke.targetStrokeId)
-        .firstOrNull;
-
-    return targetStroke != null && !targetStroke.isActive;
+    return await _database.canRedo(sessionId);
   }
 
   Stream<List<DrawingStroke>> watchStrokes(String sessionId) {
     return _database.watchStrokesForSession(sessionId).map((strokesData) {
-      final strokes = strokesData
-          .map((strokeData) => _convertToDrawingStroke(strokeData))
-          .where((stroke) => stroke.isActive)
-          .toList();
-
-      return strokes;
-    });
-  }
-
-  Stream<List<DrawingStroke>> watchAllPendingStrokes() {
-    return _database.watchAllPendingStrokes().map((strokesData) {
-      final strokes = strokesData
-          .map((strokeData) => _convertToDrawingStroke(strokeData))
-          .toList();
-
-      return strokes;
-    });
-  }
-
-  Stream<List<DrawingStroke>> watchPendingStrokesForSession(String sessionId) {
-    return _database.watchPendingStrokesForSession(sessionId).map((
-      strokesData,
-    ) {
       final strokes = strokesData
           .map((strokeData) => _convertToDrawingStroke(strokeData))
           .toList();
@@ -322,20 +263,26 @@ class DriftCanvasRepository {
         .toList();
   }
 
-  Future<List<String>> getSessionIdsWithPendingSync() async {
-    return await _database.getSessionIdsWithPendingSync();
+  Future<List<DrawingStroke>> getActiveStrokes(String sessionId) async {
+    final allStrokesData = await _database.getStrokesForSession(sessionId);
+    final drawStrokes = allStrokesData
+        .where((s) => s.operation == 'draw' && s.isActive)
+        .toList();
+
+    return drawStrokes
+        .map((strokeData) => _convertToDrawingStroke(strokeData))
+        .toList();
   }
 
   Future<void> updateStrokeSyncStatus(
     String strokeId,
-    String serverId,
+
     int serverVersion,
     DateTime serverCreatedAt,
   ) async {
     try {
       await _database.updateStrokeSyncStatus(
         strokeId,
-        serverId,
         serverVersion,
         serverCreatedAt,
       );
@@ -344,32 +291,35 @@ class DriftCanvasRepository {
     }
   }
 
-  Future<void> updateStrokeFromRemote(
+  Future<void> batchUpdateStrokesFromRemote(
     String sessionId,
-    DrawingStroke stroke,
+    List<DrawingStroke> strokes,
   ) async {
     try {
-      final strokeCompanion = StrokesCompanion(
-        id: Value(stroke.id),
-        sessionId: Value(sessionId),
-        userId: Value(stroke.userId),
-        points: Value(
-          jsonEncode(stroke.points.map((p) => p.toJson()).toList()),
-        ),
-        createdAt: Value(stroke.createdAt),
-        operation: Value(stroke.operation),
-        targetStrokeId: Value(stroke.targetStrokeId),
-        isActive: Value(stroke.isActive),
-        version: stroke.version != null
-            ? Value(stroke.version!)
-            : const Value.absent(),
-        localVersion: const Value.absent(),
-        syncStatus: Value('synced'),
-      );
-
-      await _database.addOrUpdateStroke(strokeCompanion);
+      final companions = strokes
+          .map(
+            (stroke) => StrokesCompanion(
+              id: Value(stroke.id),
+              sessionId: Value(sessionId),
+              userId: Value(stroke.userId),
+              points: Value(
+                jsonEncode(stroke.points.map((p) => p.toJson()).toList()),
+              ),
+              createdAt: Value(stroke.createdAt),
+              operation: Value(stroke.operation),
+              targetStrokeId: Value(stroke.targetStrokeId),
+              isActive: Value(stroke.isActive),
+              version: stroke.version != null
+                  ? Value(stroke.version!)
+                  : const Value.absent(),
+              localVersion: const Value.absent(),
+              syncStatus: Value('synced'),
+            ),
+          )
+          .toList();
+      await _database.batchAddOrUpdateStrokes(companions);
     } catch (e) {
-      throw Exception('Failed to update stroke from remote: $e');
+      throw Exception('Failed to batch update strokes from remote: $e');
     }
   }
 
@@ -389,7 +339,6 @@ class DriftCanvasRepository {
       targetStrokeId: strokeData.targetStrokeId,
       isActive: strokeData.isActive,
       version: strokeData.version,
-      syncStatus: strokeData.syncStatus,
     );
   }
 }

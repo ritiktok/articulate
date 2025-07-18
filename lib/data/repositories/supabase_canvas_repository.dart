@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'package:supabase_flutter/supabase_flutter.dart';
+import 'package:flutter/foundation.dart';
 import '../models/canvas_session.dart';
 import '../models/drawing_stroke.dart';
 
@@ -83,17 +84,56 @@ class SupabaseCanvasRepository {
     }
   }
 
-  Stream<List<DrawingStroke>> watchStrokesForSession(String sessionId) {
-    return _supabase
+  Future<List<PostgrestMap>> batchAddStrokes(
+    String sessionId,
+    List<DrawingStroke> strokes,
+  ) async {
+    try {
+      final insertData = strokes
+          .map(
+            (stroke) => {
+              'id': stroke.id,
+              'session_id': sessionId,
+              'user_id': stroke.userId,
+              'points': jsonEncode(
+                stroke.points.map((p) => p.toJson()).toList(),
+              ),
+              'created_at': stroke.createdAt.toIso8601String(),
+              'operation': stroke.operation,
+              'target_stroke_id': stroke.targetStrokeId,
+              'is_active': stroke.isActive,
+            },
+          )
+          .toList();
+
+      final result = await _supabase
+          .from('drawing_strokes')
+          .insert(insertData)
+          .select('id, version, created_at');
+
+      return result;
+    } catch (e) {
+      throw Exception('Failed to batch create strokes: $e');
+    }
+  }
+
+  Stream<List<DrawingStroke>> watchStrokesForSession(String sessionId) async* {
+    try {
+      final initialStrokes = await getAllStrokesForSession(sessionId);
+      yield initialStrokes;
+    } catch (e) {
+      if (kDebugMode) {
+        print('Failed to fetch initial strokes: $e');
+      }
+      yield <DrawingStroke>[];
+    }
+
+    yield* _supabase
         .from('drawing_strokes')
         .stream(primaryKey: ['id'])
         .map((event) {
           final strokes = event
-              .where(
-                (json) =>
-                    json['session_id'] == sessionId &&
-                    json['is_active'] == true,
-              )
+              .where((json) => json['session_id'] == sessionId)
               .map((json) => DrawingStroke.fromJson(json))
               .toList();
 
@@ -110,52 +150,29 @@ class SupabaseCanvasRepository {
         });
   }
 
-  Future<List<DrawingStroke>> getStrokesForSession(String sessionId) async {
+  Future<List<DrawingStroke>> getAllStrokesForSession(String sessionId) async {
     try {
       final response = await _supabase
           .from('drawing_strokes')
           .select()
           .eq('session_id', sessionId)
           .eq('is_active', true)
-          .order('version');
+          .eq('operation', 'draw')
+          .order('created_at');
 
       final strokes = response
           .map((json) => DrawingStroke.fromJson(json))
           .toList();
 
+      strokes.sort((a, b) {
+        final aVersion = a.version ?? 0;
+        final bVersion = b.version ?? 0;
+        return aVersion.compareTo(bVersion);
+      });
+
       return strokes;
     } catch (e) {
       throw Exception('Failed to get strokes for session: $e');
-    }
-  }
-
-  Future<bool> canUndo(String sessionId) async {
-    try {
-      final response = await _supabase
-          .from('drawing_strokes')
-          .select('id')
-          .eq('session_id', sessionId)
-          .eq('is_active', true)
-          .eq('operation', 'draw');
-
-      return response.isNotEmpty;
-    } catch (e) {
-      throw Exception('Failed to check if can undo: $e');
-    }
-  }
-
-  Future<bool> canRedo(String sessionId) async {
-    try {
-      final response = await _supabase
-          .from('drawing_strokes')
-          .select('id')
-          .eq('session_id', sessionId)
-          .eq('is_active', false)
-          .eq('operation', 'draw');
-
-      return response.isNotEmpty;
-    } catch (e) {
-      throw Exception('Failed to check if can redo: $e');
     }
   }
 }
